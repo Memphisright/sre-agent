@@ -218,6 +218,7 @@ def kubectl_describe_deployment(deployment_name: str, namespace: str = "default"
         out = [
             f"Name: {d.metadata.name}",
             f"Namespace: {d.metadata.namespace}",
+            f"ResourceVersion: {d.metadata.resource_version}",
             f"Replicas: desired={d.spec.replicas}, ready={d.status.ready_replicas}, "
             f"available={d.status.available_replicas}",
             f"Strategy: {d.spec.strategy.type if d.spec.strategy else 'unknown'}",

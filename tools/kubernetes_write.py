@@ -23,18 +23,70 @@ def _safe(fn):
 def kubectl_scale_deployment(
     deployment_name: str,
     namespace: str,
+    approved_current_replicas: int,
     replicas: int,
+    expected_resource_version: str,
 ) -> str:
     """
-    Scale a deployment to the specified number of replicas.
+    Conditionally scale a deployment to the specified number of replicas.
+
+    approved_current_replicas and expected_resource_version MUST come from the
+    same pre-approval read. Kubernetes atomically rejects the Scale replacement
+    if resourceVersion changed while approval was pending, so an old approval
+    cannot overwrite newer cluster state.
     REQUIRES HUMAN APPROVAL before execution.
     """
     def _run():
-        patch = {"spec": {"replicas": replicas}}
-        apps_v1().patch_namespaced_deployment_scale(
-            deployment_name, namespace, patch
+        def stale(reason: str, *, api_conflict: bool = False) -> str:
+            label = "STALE APPROVAL [409 Conflict]" if api_conflict else "STALE APPROVAL"
+            return (
+                f"{label}: deployment "
+                f"{namespace}/{deployment_name} {reason}; the approved scale "
+                f"from {approved_current_replicas} to {replicas} was not applied. "
+                "Read current state and request a new approval."
+            )
+
+        if not expected_resource_version.strip():
+            return "ERROR: expected_resource_version is required for a safe scale"
+        if approved_current_replicas < 0 or replicas < 0:
+            return "ERROR: replica counts must be non-negative"
+
+        api = apps_v1()
+        current = api.read_namespaced_deployment_scale(
+            deployment_name, namespace
         )
-        return f"Scaled {deployment_name} in {namespace} to {replicas} replicas."
+        if (
+            current.metadata.resource_version != expected_resource_version
+            or current.spec.replicas != approved_current_replicas
+        ):
+            return stale(
+                "changed after approval was requested "
+                f"(now replicas={current.spec.replicas}, "
+                f"resourceVersion={current.metadata.resource_version})"
+            )
+
+        scale = k8s_client.V1Scale(
+            api_version="autoscaling/v1",
+            kind="Scale",
+            metadata=k8s_client.V1ObjectMeta(
+                name=deployment_name,
+                namespace=namespace,
+                resource_version=expected_resource_version,
+            ),
+            spec=k8s_client.V1ScaleSpec(replicas=replicas),
+        )
+        try:
+            api.replace_namespaced_deployment_scale(
+                deployment_name, namespace, scale
+            )
+        except ApiException as error:
+            if error.status == 409:
+                return stale("changed during conditional execution", api_conflict=True)
+            raise
+        return (
+            f"Scaled {deployment_name} in {namespace} from approved "
+            f"{approved_current_replicas} to {replicas} replicas."
+        )
     return _safe(_run)
 
 
